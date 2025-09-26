@@ -1,0 +1,311 @@
+---
+title: 'POLÍTICA MONETARIA Y RENTABILIDAD DE LA BANCA COMERCIAL EN HONDURAS 2017 A 2023: ANÁLISIS DE TRANSMISIÓN CON MODELO FAVAR '
+author: "Alejandro Figueroa, Diego Hernández y Kelsy Barahona"
+date: "2025-09-09"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Librerías 
+
+```{r Librerias, echo=TRUE, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(tseries)
+library(zoo)
+library(ggplot2)
+library(factoextra)
+library(nFactors)
+```
+
+
+## Datos
+
+```{r ETL, echo=TRUE}
+BancosDB <- read_excel("C:/Users/hdieg/Documents/Tesis PG/TS/BancosDB.xlsx")
+
+MacroFInDB <- read_excel("C:/Users/hdieg/Documents/Tesis PG/TS/MacroFInDB.xlsx")
+
+head(BancosDB)
+
+head(MacroFInDB)
+```
+
+## Transformar datos bancarios
+
+```{r ETL Bancos, echo=TRUE}
+# Primero se transformará la base de datos de bancos para agrupar los bancos en bancos grandes y bancos pequeños y poder comparar el impacto en los indicadores de ambos grupos
+
+# Lista de bancos grandes
+bancos_grandes <- c("FICOHSA", "BANPAIS", "BAC CREDOMATIC", "BANCOCCI", "BANCATLAN")
+
+# 4. Procesar los datos para obtener los promedios
+datos_bancarios_agregados <- BancosDB %>%
+  # Clasificar cada banco como "Grandes" o "Pequenos"
+  mutate(Grupo = ifelse(Logo %in% bancos_grandes, "Grandes", "Pequenos")) %>%
+  
+  # Agrupar por la fecha, el indicador y el grupo para calcular los promedios
+  group_by(FechaReporte, Indicador, Grupo) %>%
+  
+  # Calcular el promedio del saldo para cada grupo e indicador
+  summarise(
+    Promedio = mean(Saldo, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 5. Reformar la tabla para el modelo
+# Usar pivot_wider para tener los indicadores de cada grupo en columnas separadas
+datos_bancarios_final <- datos_bancarios_agregados %>%
+  pivot_wider(
+    names_from = c(Indicador, Grupo),
+    values_from = Promedio,
+    names_sep = "_"
+  )
+
+# Verificar la estructura final
+head(datos_bancarios_final)
+```
+
+## Transformar datos macroeconómicos y financieros
+
+```{r ETL Macro y Fin, echo=TRUE}
+
+# 1. Transformar las variables con la diferencia de logaritmos
+# La función 'lag()' de dplyr es perfecta para esto, ya que se refiere al valor del periodo anterior.
+datos_macro_transformados <- MacroFInDB %>%
+  mutate(
+    ExpHN_ld = log(ExpHN) - log(lag(ExpHN)),
+    ImpHN_ld = log(ImpHN) - log(lag(ImpHN)),
+    USDWTI_ld = log(USDWTI) - log(lag(USDWTI)),
+    USDcafe_ld = log(USDcafe) - log(lag(USDcafe)),
+    USDban_ld = log(USDban) - log(lag(USDban)),
+    USDHNL_ld = log(USDHNL) - log(lag(USDHNL))
+  )
+
+# 2. Filtrar las fechas para tener el rango deseado
+# La primera fila (diciembre de 2016) se convierte en NA al aplicar la diferencia de logaritmos.
+# Por lo tanto, eliminaremos esa fila para que el conjunto de datos comience en enero de 2017.
+datos_macro_final <- datos_macro_transformados %>%
+  filter(Fecha >= "2017-01-01")
+
+# Comom última transformación, imputaremos los tres meses faltantes para la variable TIB para que no haya sesgo en el modelo FAVAR
+
+datos_macro_final$TIB <- na.approx(datos_macro_final$TIB, na.rm = FALSE)
+
+# Ahora, la tabla 'datos_macro_final' tiene los datos transformados y listos para unirse con los datos bancarios
+# Puedes verificar el resultado con las primeras filas
+head(datos_macro_final)
+```
+
+## Unir tablas y preparar para modelar
+
+```{r datos para modelo, echo=TRUE}
+
+# Unir las dos bases de datos especificando los nombres de las columnas a unir
+# La sintaxis 'c("nombre_en_tabla1" = "nombre_en_tabla2")' le dice a R cómo alinear las filas
+datos_para_modelo_final <- inner_join(datos_macro_final, datos_bancarios_final, by = c("Fecha" = "FechaReporte"))
+
+# Verificar el resultado para asegurarte de que las columnas están unidas correctamente
+head(datos_para_modelo_final)
+
+# Removemos los datos originales de las variables a las que le aplicamos diferencia de logaritmos
+datos_para_modelo_final <- datos_para_modelo_final %>%
+  dplyr::select(-ExpHN, -ImpHN, -USDWTI, -USDcafe, -USDban, -USDHNL)
+
+# Verificar las primeras filas de la tabla para confirmar que las columnas fueron eliminadas
+head(datos_para_modelo_final)
+```
+## Inducir Estacionariedad
+
+```{r probar estacionariedad, echo=TRUE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# 1. Seleccionar las variables para el análisis, excluyendo la fecha
+variables_modelo_crudo <- datos_para_modelo_final %>%
+  dplyr::select(-Fecha)
+
+# **SOLUCIÓN AL ERROR:** Eliminar columnas con todos los valores NA
+variables_modelo_crudo <- variables_modelo_crudo %>%
+  dplyr::select_if(~!all(is.na(.)))
+
+# --- Multiplicar por 100 para trabajar en formato de porcentaje ---
+
+# Columnas que NO se deben multiplicar
+columnas_a_excluir <- c("DEPOSITOS_Grandes", "DEPOSITOS_Pequenos")
+
+# Usamos 'mutate()' con 'across()' para aplicar la operación a todas las columnas EXCEPTO las excluidas.
+# El guion (-) antes de 'c()' significa "excluir".
+variables_modelo_crudo_porc <- variables_modelo_crudo %>%
+  mutate(across(-all_of(columnas_a_excluir), ~ .x * 100))
+
+# Verificar las primeras filas para confirmar que la operación funcionó correctamente.
+# Deberías ver que DEPOSITOS_Grandes y DEPOSITOS_Pequenos mantienen sus valores originales,
+# mientras que las demás columnas han sido multiplicadas por 100.
+head(variables_modelo_crudo_porc)
+
+# 2. Definir un nivel de significancia (alpha)
+alpha <- 0.05
+
+# 3. Probar la estacionariedad de cada variable
+probar_estacionariedad <- function(serie) {
+  if (length(unique(na.omit(serie))) <= 1) {
+    return(1)
+  }
+  test_result <- tseries::adf.test(serie, alternative = "stationary")
+  return(test_result$p.value)
+}
+
+# Realizar la prueba ADF
+resultados_adf_inicial <- sapply(variables_modelo_crudo_porc, probar_estacionariedad)
+
+# 4. Iterar y aplicar primeras diferencias a las variables no estacionarias
+variables_modelo_estacionarias <- variables_modelo_crudo_porc
+
+for(col_name in names(variables_modelo_estacionarias)) {
+  p_valor <- probar_estacionariedad(variables_modelo_estacionarias[[col_name]])
+  iteracion <- 0
+  while(p_valor > alpha && iteracion < 2) {
+    variables_modelo_estacionarias[[col_name]] <- variables_modelo_estacionarias[[col_name]] - lag(variables_modelo_estacionarias[[col_name]])
+    p_valor <- probar_estacionariedad(na.omit(variables_modelo_estacionarias[[col_name]]))
+    iteracion <- iteracion + 1
+  }
+}
+
+# 5. Eliminar la primera fila (con NA) que resulta de la diferenciación
+variables_modelo_estacionarias <- na.omit(variables_modelo_estacionarias)
+
+# Guardamos las desviaciones estándar de las variables que nos interesan ANTES de estandarizar.
+# Esta es la "llave" para revertir la transformación en el análisis IRF.
+original_sds <- apply(variables_modelo_estacionarias, 2, sd)
+
+# 6. Estandarizar las variables
+variables_modelo_estandarizadas <- scale(variables_modelo_estacionarias)
+variables_modelo_estandarizadas_df <- as.data.frame(variables_modelo_estandarizadas)
+```
+
+## Modelo
+
+```{r Extracción de Factores, echo=TRUE, message=FALSE, warning=FALSE}
+
+# 1. Separar las variables del modelo
+# Variables 'lentas' y 'rápidas' que NO son factores, sino las observables de interés.
+# La TIB es la variable de política monetaria.
+variables_observables_Y <- variables_modelo_estandarizadas_df %>%
+  dplyr::select(
+    TIB,
+    ROA_Grandes, ROE_Grandes, `MARGEN DE INTERMEDIACION_Grandes`,
+    ROA_Pequenos, ROE_Pequenos, `MARGEN DE INTERMEDIACION_Pequenos`
+  )
+
+# Variables informacionales (X_t) son TODAS las demás.
+variables_informacionales_X <- variables_modelo_estandarizadas_df %>%
+  dplyr::select(-names(variables_observables_Y))
+
+# 2. Determinar el número óptimo de factores a extraer de X_t
+
+# Gráfico de sedimentación (Scree Plot)
+fviz_eig(prcomp(variables_informacionales_X, scale. = FALSE), addlabels = TRUE)
+
+# Basado en los criterios, elige un número.
+num_factores_optimo <- 4 # <-- ¡AJUSTA ESTE NÚMERO SEGÚN LOS RESULTADOS!
+
+# 3. Extraer los factores óptimos de TODAS las variables informacionales
+pca_global <- prcomp(variables_informacionales_X, scale. = FALSE)
+factores_estimados <- pca_global$x[, 1:num_factores_optimo]
+colnames(factores_estimados) <- paste0("Factor", 1:num_factores_optimo)
+
+# 4. Unir observables y factores en el orden correcto para la identificación
+datos_para_favar <- cbind(
+  dplyr::select(variables_observables_Y, TIB),  
+  dplyr::select(variables_observables_Y, -TIB),
+    factores_estimados                  
+)
+
+modelo_favar <- vars::VAR(datos_para_favar, p = 5, type = "const")
+summary(modelo_favar)
+```
+
+## Análisis IRF
+
+```{r IRF, echo=TRUE, message=FALSE, warning=FALSE}
+
+# 1. Definir las variables de respuesta de interés
+response_variables <- c("ROA_Grandes", "ROE_Grandes", "MARGEN.DE.INTERMEDIACION_Grandes",
+                        "ROE_Pequenos", "MARGEN.DE.INTERMEDIACION_Pequenos","ROA_Pequenos" )
+
+# 2. Calcular las IRF con los datos estandarizados (como antes)
+irf_scaled <- vars::irf(modelo_favar,
+                        impulse = "TIB",
+                        response = response_variables,
+                        n.ahead = 36,
+                        boot = TRUE,
+                        runs = 1000,
+                        ci = 0.90)
+
+#------------------------------------------------------------------
+# 3. RE-ESCALAR LOS RESULTADOS PARA INTERPRETACIÓN
+#------------------------------------------------------------------
+
+# 3a. Definir el tamaño del shock deseado en unidades originales (25 pbs = 0.25)
+shock_size_bp <- 0.50
+
+# 3b. Obtener la desviación estándar original de la variable de impulso (TIB)
+sd_tib_original <- original_sds["TIB"]
+
+# 3c. Calcular el factor de ajuste
+# El shock por defecto es de 1 desviación estándar. Lo ajustamos a 25 pbs.
+adjustment_factor <- shock_size_bp / sd_tib_original
+
+# 3d. Crear una copia de los resultados para re-escalar
+irf_rescaled <- irf_scaled
+
+# 3e. Aplicar el ajuste a todas las respuestas (IRF y bandas de confianza)
+for (variable in response_variables) {
+  # Obtener la desviación estándar original de la variable de respuesta actual
+  sd_response_var <- original_sds[variable]
+  
+  # Re-escalar la IRF, el límite inferior y el límite superior
+  irf_rescaled$irf[[variable]] <- irf_scaled$irf[[variable]] * adjustment_factor * sd_response_var
+  irf_rescaled$Lower[[variable]] <- irf_scaled$Lower[[variable]] * adjustment_factor * sd_response_var
+  irf_rescaled$Upper[[variable]] <- irf_scaled$Upper[[variable]] * adjustment_factor * sd_response_var
+}
+
+# 4. Visualizar los resultados re-escalados
+# El eje 'y' ahora representa la variación en puntos porcentuales de cada indicador
+# ante un shock de +25 pbs en la TIB.
+plot(irf_rescaled, main = "Respuesta a un Shock de +50 pbs en la TIB")
+```
+
+## Análisis FEDV
+```{r FEDV, message=FALSE, warning=FALSE}
+
+# --- PASO 1: Realizar el análisis FEVD ---
+# La función 'fevd()' calcula la descomposición de la varianza del error de pronóstico.
+# En este caso, veremos cómo los shocks de todas las variables del modelo
+# explican la varianza de las variables de rentabilidad a 12 periodos.
+
+fevd_analisis <- vars::fevd(modelo_favar, n.ahead = 12)
+
+# Para visualizar de forma más clara los resultados de las variables de interés,
+# puedes acceder a la lista dentro del objeto fevd_analisis.
+
+# Descomposición de la varianza del ROA de los bancos grandes
+print(fevd_analisis$ROA_Grandes)
+
+# Descomposición de la varianza del ROE de los bancos grandes
+print(fevd_analisis$ROE_Grandes)
+
+# Descomposición de la varianza del Margen de intermediación de los bancos grandes
+print(fevd_analisis$MARGEN.DE.INTERMEDIACION_Grandes)
+
+# Descomposición de la varianza del ROA de los bancos grandes
+print(fevd_analisis$ROA_Pequenos)
+
+# Descomposición de la varianza del ROE de los bancos grandes
+print(fevd_analisis$ROE_Pequenos)
+
+# Descomposición de la varianza del Margen de intermediación de los bancos grandes
+print(fevd_analisis$MARGEN.DE.INTERMEDIACION_Pequenos)
+```
+
